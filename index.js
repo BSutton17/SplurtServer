@@ -1,93 +1,186 @@
 const express = require("express");
-const app = express();
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 
+const app = express();
 app.use(cors());
+
+// Heroku eco dynos sleep after 30 minutes without an HTTP request, and an open
+// socket does not count. The client hits this every few minutes mid-game.
+app.get("/ping", (_req, res) => {
+  res.set("Cache-Control", "no-store").send("pong");
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "https://splurt.netlify.app",
+    origin: ["http://localhost:5173", "https://splurt.netlify.app"],
     methods: ["GET", "POST"],
   },
 });
 
-let players = [];
+// A dropped player keeps their score this long - long enough for a phone to
+// lock and come back between rounds.
+const RECONNECT_GRACE_MS = 10 * 60 * 1000;
+const MAX_NAME_LENGTH = 20;
+const MAX_ID_LENGTH = 64;
+const MAX_CARD_LENGTH = 200;
+const MAX_DECK_SIZE = 2000;
+const MAX_SCORE_STEP = 10;
+
+// One shared game for the whole party. Players are keyed by a playerId the
+// browser keeps across reloads (not socket.id, which changes on every
+// reconnect), so a dropped connection gets its score back.
+let players = []; // { id, name, score, socketId, connected }
+const graceTimers = {};
+
 let availablePrompts = [];
 let availableRules = [];
 
-io.on('connection', (socket) => {
-  console.log('A user connected');
+// What is on screen right now, so a reloaded or reconnected phone catches up.
+let currentPrompt = null;
+let currentRule = null;
+let pendingRuleTimer = null;
 
-  socket.on("joinGame", (playerName) => {
-    // Check if player already exists
-    const existingPlayer = players.find(p => p.id === socket.id);
-    
-    if (existingPlayer) {
-      // Update existing player's name
-      existingPlayer.name = playerName;
-      console.log(`${playerName} updated their name`);
+const publicPlayers = () =>
+  players.map(({ id, name, score, connected }) => ({ id, name, score, connected }));
+
+const emitPlayers = () => io.emit("updatePlayers", publicPlayers());
+
+// Trimmed string, or "" when the value is missing, not a string, or too long.
+const cleanString = (value, maxLength) => {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return trimmed.length <= maxLength ? trimmed : "";
+};
+
+// The client sends its card lists; keep only sane string entries.
+const cleanDeck = (deck) =>
+  Array.isArray(deck)
+    ? deck.slice(0, MAX_DECK_SIZE).map((card) => cleanString(card, MAX_CARD_LENGTH)).filter(Boolean)
+    : [];
+
+const drawCard = (deck) => {
+  const index = Math.floor(Math.random() * deck.length);
+  return deck.splice(index, 1)[0];
+};
+
+function clearGraceTimer(id) {
+  clearTimeout(graceTimers[id]);
+  delete graceTimers[id];
+}
+
+// The player record this socket currently owns, if any.
+const seatFor = (socket) => {
+  const player = players.find((p) => p.id === socket.data.playerId);
+  return player && player.socketId === socket.id ? player : null;
+};
+
+// One bad packet must never crash the process - the scores live in memory.
+const safely = (event, handler) => (...args) => {
+  try {
+    handler(...args);
+  } catch (error) {
+    console.error(`Error handling "${event}":`, error);
+  }
+};
+
+io.on("connection", (socket) => {
+  console.log("A user connected:", socket.id);
+  const on = (event, handler) => socket.on(event, safely(event, handler));
+
+  // Catch up whoever just (re)connected.
+  socket.emit("updatePlayers", publicPlayers());
+  if (currentPrompt) socket.emit("updatePrompt", currentPrompt);
+  if (currentRule) socket.emit("updateRule", currentRule);
+
+  // Accepts joinGame({ name, playerId }) or the older joinGame(name).
+  on("joinGame", (data) => {
+    const payload = typeof data === "string" ? { name: data } : data || {};
+    const name = cleanString(payload.name, MAX_NAME_LENGTH);
+    const id = cleanString(payload.playerId, MAX_ID_LENGTH) || socket.id;
+    if (!name) return;
+
+    const existing = players.find((p) => p.id === id);
+    if (existing) {
+      // Rename, refresh or reconnect - keep the score.
+      clearGraceTimer(id);
+      existing.name = name;
+      existing.socketId = socket.id;
+      existing.connected = true;
+      console.log(`${name} is back`);
     } else {
-      // Add new player
-      const newPlayer = {
-        id: socket.id,
-        name: playerName,
-        score: 0
-      };
-      players.push(newPlayer);
-      console.log(`${playerName} joined the game`);
+      players.push({ id, name, score: 0, socketId: socket.id, connected: true });
+      console.log(`${name} joined the game`);
     }
-    
-    io.emit("updatePlayers", players);
+
+    socket.data.playerId = id;
+    emitPlayers();
   });
 
-  socket.on("ruleChange", ({ prompts, rules }) => {
-    // Reset availablePrompts if empty
-    if (availablePrompts.length === 0) {
-      availablePrompts = [...prompts];
-    }
-    // Reset availableRules if empty
-    if (availableRules.length === 0) {
-      availableRules = [...rules];
-    }
+  on("ruleChange", (data) => {
+    // Refill a deck once it runs out.
+    if (availablePrompts.length === 0) availablePrompts = cleanDeck(data?.prompts);
+    if (availableRules.length === 0) availableRules = cleanDeck(data?.rules);
+    if (availablePrompts.length === 0 || availableRules.length === 0) return;
 
-    // Pick random prompt
-    const promptIndex = Math.floor(Math.random() * availablePrompts.length);
-    const selectedPrompt = availablePrompts[promptIndex];
-    availablePrompts = availablePrompts.filter((_, index) => index !== promptIndex);
+    currentPrompt = drawCard(availablePrompts);
+    currentRule = null;
+    io.emit("updatePrompt", currentPrompt);
 
-    // Pick random rule
-    const ruleIndex = Math.floor(Math.random() * availableRules.length);
-    const selectedRule = availableRules[ruleIndex];
-    availableRules = availableRules.filter((_, index) => index !== ruleIndex);
-
-    // Send prompt immediately
-    io.emit("updatePrompt", selectedPrompt);
-
-    // Send rule after 2-4 second delay
-    const delay = Math.floor(Math.random() * 2000) + 2000; // 2000-4000ms
-    setTimeout(() => {
-      io.emit("updateRule", selectedRule);
+    // The rule lands 2-4 seconds later. A quick second click cancels the
+    // pending rule so an old one can't show up under the new prompt.
+    clearTimeout(pendingRuleTimer);
+    const rule = drawCard(availableRules);
+    const delay = Math.floor(Math.random() * 2000) + 2000;
+    pendingRuleTimer = setTimeout(() => {
+      pendingRuleTimer = null;
+      currentRule = rule;
+      io.emit("updateRule", rule);
     }, delay);
   });
 
-  socket.on("updateScore", ({ playerId, delta }) => {
-    const player = players.find(p => p.id === playerId);
-    if (player) {
-      player.score += delta;
-      io.emit("updatePlayers", players);
-    }
+  on("updateScore", (data) => {
+    const player = players.find((p) => p.id === data?.playerId);
+    const delta = Number(data?.delta);
+    if (!player || !Number.isInteger(delta) || Math.abs(delta) > MAX_SCORE_STEP) return;
+
+    player.score += delta;
+    emitPlayers();
   });
 
-  socket.on("disconnect", () => {
-    console.log("A user disconnected");
-    players = players.filter(p => p.id !== socket.id);
-    io.emit("updatePlayers", players);
+  on("disconnect", (reason) => {
+    console.log(`A user disconnected: ${socket.id} (${reason})`);
+
+    const player = seatFor(socket);
+    if (!player) return;
+
+    // Hold the seat and score; only drop them if they never come back.
+    player.connected = false;
+    emitPlayers();
+
+    clearGraceTimer(player.id);
+    graceTimers[player.id] = setTimeout(() => {
+      const stillGone = players.find((p) => p.id === player.id);
+      if (stillGone && !stillGone.connected) {
+        console.log(`${stillGone.name} did not come back - removing`);
+        players = players.filter((p) => p.id !== player.id);
+        delete graceTimers[player.id];
+        emitPlayers();
+      }
+    }, RECONNECT_GRACE_MS);
   });
 });
 
 server.listen(process.env.PORT || 3001, () => {
   console.log("SERVER RUNNING");
+});
+
+// Heroku sends SIGTERM when it restarts or sleeps the dyno. Close sockets
+// cleanly so every client starts reconnecting straight away.
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received - shutting down");
+  io.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
 });
